@@ -40,73 +40,64 @@ public class GraphicalConsole {
     Thread stdoutAdapter;
     Thread stderrAdapter;
     final Process process;
+    final static String LINE_SEPARATOR = System.lineSeparator();
 
     class StreamToQueueAdapter implements Runnable {
 
         final BufferedReader reader;
         final JTextArea guiLog;
-        final static String LINE_SEPARATOR = System.lineSeparator();
 
         StreamToQueueAdapter(InputStream stream, JTextArea guiLog) {
             reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8));
             this.guiLog = guiLog;
         }
 
-        @Override
+           @Override
         public void run() {
-            while (true) {
-                try {
-                    final String line = reader.readLine();
-                    if (line == null) {
-                        // EOF
-                        break;
-                    }
-                    invokeOnSwingThread(false, () -> {
-                        while (!consoleBuffer.isEmpty()) {
-                            final String bufferedLine = consoleBuffer.remove();
-                            try {
-                                guiLog.getDocument()
-                                    .insertString(
-                                        guiLog.getDocument()
-                                            .getLength(),
-                                        bufferedLine + LINE_SEPARATOR,
-                                        null);
-                            } catch (BadLocationException e) {
-                                // ignored
-                            }
-                        }
-                    });
-                    final long currLogSize = logSize.addAndGet(line.length() + 1);
-                    if (currLogSize > MAX_LOG_SIZE) {
-                        final boolean prevExceeded = logSizeExceededMax.getAndSet(true);
-                        if (!prevExceeded) {
-                            consoleBuffer.add("Max console size exceeded, > " + MAX_LOG_SIZE + " bytes!");
-                        }
-                        return;
-                    }
-                    consoleBuffer.add(line);
-                } catch (IOException e) {
-                    break;
-                }
-            }
             try {
-                reader.close();
-            } catch (IOException e) {
-                // ignored
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    long currSize = logSize.addAndGet(line.length() + 1);
+                    if (currSize > MAX_LOG_SIZE) {
+                        if (!logSizeExceededMax.getAndSet(true)) {
+                            invokeOnSwingThread(false, () -> {
+                                guiLog.setText(""); // clear previous logs
+                                try {
+                                    guiLog.getDocument().insertString(
+                                        guiLog.getDocument().getLength(),
+                                        "Max console size exceeded, logs cleared!" + LINE_SEPARATOR,
+                                        null
+                                    );
+                                } catch (BadLocationException ignored) {}
+                            });
+                            logSize.set(line.length() + 1); // reset log size to current line
+                        }
+                    }
+                    // Write current line to GUI
+                    final String logLine = line;
+                    invokeOnSwingThread(false, () -> {
+                        try {
+                            guiLog.getDocument().insertString(guiLog.getDocument().getLength(), logLine + LINE_SEPARATOR, null);
+                        } catch (BadLocationException ignored) {}
+                    });
+                }
+            } catch (IOException ignored) {}
+            finally {
+                try { reader.close(); } catch (IOException ignored) {}
             }
         }
     }
+    
 
-    public GraphicalConsole(final InputStream stdout, final InputStream stderr, final Process process) {
+    public GraphicalConsole(InputStream stdout, InputStream stderr, Process process) {
         this.stdout = stdout;
         this.stderr = stderr;
         this.process = process;
+
         try {
             System.setProperty("awt.useSystemAAFontSettings", "on");
             LafManager.installTheme(new PreferredThemeStyle(ContrastRule.STANDARD, ColorToneRule.DARK));
-        } catch (Exception e) {
-            consoleBuffer.add("Could not initialize DarkLaf GUI theme");
-        }
+        } catch (Exception ignored) {}
 
         invokeOnSwingThread(true, () -> {
             final JFrame consoleWindow = new JFrame("Lwjgl3ify relaunch console");
@@ -115,29 +106,24 @@ public class GraphicalConsole {
 
             final JTextArea logArea = new JTextArea();
             logArea.setEditable(false);
-            logArea.setFont(
-                Font.decode(Font.MONOSPACED)
-                    .deriveFont(14.0f));
+            logArea.setFont(Font.decode(Font.MONOSPACED).deriveFont(14f));
             try {
-                logArea.getDocument()
-                    .insertString(
-                        logArea.getDocument()
-                            .getLength(),
-                        "Relaunching the process with new Java..." + System.lineSeparator(),
-                        null);
-            } catch (BadLocationException e) {
-                throw new RuntimeException(e);
-            }
-            final JScrollPane logScroll = new JScrollPane(logArea);
-            consoleWindow.getContentPane()
-                .add(logScroll, BorderLayout.CENTER);
+                logArea.getDocument().insertString(
+                    logArea.getDocument().getLength(),
+                    "Relaunching the process with new Java..." + System.lineSeparator(),
+                    null
+                );
+            } catch (BadLocationException ignored) {}
 
-            this.stdoutAdapter = new Thread(new StreamToQueueAdapter(stdout, logArea), "stdout adapter");
-            this.stdoutAdapter.setDaemon(true);
-            this.stdoutAdapter.start();
-            this.stderrAdapter = new Thread(new StreamToQueueAdapter(stderr, logArea), "stderr adapter");
-            this.stderrAdapter.setDaemon(true);
-            this.stderrAdapter.start();
+            final JScrollPane logScroll = new JScrollPane(logArea);
+            consoleWindow.getContentPane().add(logScroll, BorderLayout.CENTER);
+
+            stdoutAdapter = new Thread(new StreamToQueueAdapter(stdout, logArea), "stdout adapter");
+            stdoutAdapter.setDaemon(true);
+            stdoutAdapter.start();
+            stderrAdapter = new Thread(new StreamToQueueAdapter(stderr, logArea), "stderr adapter");
+            stderrAdapter.setDaemon(true);
+            stderrAdapter.start();
 
             final JPanel buttonPanel = new JPanel();
             buttonPanel.setLayout(new BoxLayout(buttonPanel, BoxLayout.X_AXIS));
@@ -145,57 +131,35 @@ public class GraphicalConsole {
             closeMeButton.addActionListener(al -> consoleWindow.dispose());
             final JButton killButton = new JButton("Kill process");
             killButton.addActionListener(al -> process.destroyForcibly());
-
             buttonPanel.add(closeMeButton);
             buttonPanel.add(killButton);
-
-            consoleWindow.getContentPane()
-                .add(buttonPanel, BorderLayout.SOUTH);
+            consoleWindow.getContentPane().add(buttonPanel, BorderLayout.SOUTH);
 
             final Thread processDeathAwaiter = new Thread(() -> {
                 try {
-                    final Process terminated = process.onExit()
-                        .get();
-                    final int exitCode = terminated.exitValue();
+                    int exitCode = process.waitFor();
                     invokeOnSwingThread(false, () -> {
                         killButton.setEnabled(false);
                         try {
-                            logArea.getDocument()
-                                .insertString(
-                                    logArea.getDocument()
-                                        .getLength(),
-                                    "Process exited with code " + exitCode,
-                                    null);
-                        } catch (BadLocationException e) {
-                            // ignored
-                        }
+                            logArea.getDocument().insertString(logArea.getDocument().getLength(),
+                                    "Process exited with code " + exitCode + LINE_SEPARATOR, null);
+                        } catch (BadLocationException ignored) {}
                     });
-
-                } catch (InterruptedException | ExecutionException e) {
-                    // ignored
-                }
+                } catch (InterruptedException ignored) {}
             }, "death awaiter");
             processDeathAwaiter.start();
-
             consoleWindow.setVisible(true);
         });
     }
 
     private void invokeOnSwingThread(boolean wait, Runnable runnable) {
         try {
-            if (wait) {
-                SwingUtilities.invokeAndWait(runnable);
-            } else {
-                SwingUtilities.invokeLater(runnable);
-            }
-        } catch (InterruptedException e) {
-            // cancelled
-        } catch (InvocationTargetException e) {
-            if (e.getCause() instanceof RuntimeException re) {
-                throw re;
-            } else {
-                throw new RuntimeException(e);
-            }
+            if (wait) SwingUtilities.invokeAndWait(runnable);
+            else SwingUtilities.invokeLater(runnable);
+        } catch (InterruptedException ignored) {}
+        catch (InvocationTargetException e) {
+            if (e.getCause() instanceof RuntimeException re) throw re;
+            else throw new RuntimeException(e);
         }
     }
 }
